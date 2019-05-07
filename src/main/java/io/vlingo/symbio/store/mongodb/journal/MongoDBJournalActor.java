@@ -4,14 +4,13 @@ import com.google.gson.Gson;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.result.UpdateResult;
 import io.vlingo.actors.Actor;
 import io.vlingo.actors.Address;
 import io.vlingo.actors.Definition;
 import io.vlingo.common.Completes;
 import io.vlingo.common.Success;
 import io.vlingo.common.Tuple2;
-import io.vlingo.lattice.model.sourcing.SourcedTypeRegistry;
-import io.vlingo.lattice.model.sourcing.SourcedTypeRegistryName;
 import io.vlingo.symbio.Entry;
 import io.vlingo.symbio.EntryAdapter;
 import io.vlingo.symbio.Source;
@@ -23,9 +22,13 @@ import io.vlingo.symbio.store.journal.JournalListener;
 import io.vlingo.symbio.store.journal.JournalReader;
 import io.vlingo.symbio.store.journal.StreamReader;
 import io.vlingo.symbio.store.mongodb.Configuration;
+import io.vlingo.symbio.store.mongodb.journal.reader.MongoDBJournalReaderActor;
+import io.vlingo.symbio.store.mongodb.journal.reader.MongoDBStreamReaderActor;
+import io.vlingo.symbio.store.mongodb.journal.reader.SequenceOffset;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 
+import java.time.Clock;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -37,12 +40,16 @@ import java.util.stream.Collectors;
 
 public class MongoDBJournalActor extends Actor implements Journal<Document> {
 
-    static final String JOURNAL_COLLECTION_NAME = "symbio_journal";
+    public static final String JOURNAL_COLLECTION_NAME = "symbio_journal";
+
+    private final Clock clock = Clock.systemUTC();
+
+    private SequenceOffset sequencePointer;
 
     private final Configuration configuration;
     private final MongoCollection<Document> journal;
 
-    private final Map<String, JournalReader<Document>> journalReaders;
+    private final Map<String, JournalReader<DocumentEntry>> journalReaders;
     private final Map<String, StreamReader<Document>> streamReaders;
     private final Map<Class<?>, EntryAdapter<Source<?>, Entry<Document>>> entryAdapters;
     private final Map<Class<?>, StateAdapter<?, State<Document>>> stateAdapters;
@@ -63,6 +70,18 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
         this.streamReaders = new HashMap<>();
         this.entryAdapters = new HashMap<>();
         this.stateAdapters = new HashMap<>();
+
+        initSequenceNumber(configuration.getJournalId());
+    }
+
+    private void initSequenceNumber(String journalId) {
+        final Document result = journal.find(new Document("sequence.id", journalId)).sort(new Document("sequence.offset", -1)).first();
+        if (result == null) {
+            this.sequencePointer = new SequenceOffset(journalId);
+        } else {
+            long latestSequenceNumber = result.get("sequence", Document.class).getLong("offset");
+            this.sequencePointer = new SequenceOffset(journalId, latestSequenceNumber).next();
+        }
     }
 
     public <S, ST> void append(String streamName, int fromStreamVersion, Source<S> source, AppendResultInterest interest, Object o) {
@@ -102,7 +121,9 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
                 .collect(Collectors.toList());
 
         final int maxVersion = version.get() - 1;
+
         final Document combinedDocument = new Document("streamName", streamName)
+                .append("sequence", new Document("timestamp", clock.millis()).append("id", sequencePointer.getId()).append("offset", sequencePointer.getOffset()))
                 .append("streamVersionStart", fromStreamVersion)
                 .append("streamVersionEnd", maxVersion)
                 .append("entries", documents)
@@ -124,7 +145,16 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
                 .append("streamVersionEnd", new Document("$gte", fromStreamVersion));
         final Document update = new Document("$setOnInsert", combinedDocument);
 
-        journal.updateOne(filter, update, new UpdateOptions().upsert(true));
+        final UpdateResult updateResult = journal.updateOne(filter, update, new UpdateOptions().upsert(true));
+
+        boolean success = updateResult.getUpsertedId() != null;
+
+        if (success) {
+            this.sequencePointer = sequencePointer.next();
+        } else {
+            // TODO ERROR HANDLING!!!
+            throw new IllegalStateException("");
+        }
 
         return Tuple2.from(entries, state);
     }
@@ -136,15 +166,15 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
     private Document entryAsDocument(Entry<Document> entry, int streamVersion) {
         return new Document("_id", new ObjectId())
                 .append("streamVersion", streamVersion)
-                .append("typeVersion", entry.typeVersion)
-                .append("metadata", asJson(entry.metadata))
-                .append("document", entry.entryData)
-                .append("type", entry.type);
+                .append("typeVersion", entry.typeVersion())
+                .append("metadata", asJson(entry.metadata()))
+                .append("document", entry.entryData())
+                .append("type", entry.type());
     }
 
     @SuppressWarnings("unchecked")
-    public Completes<JournalReader<Document>> journalReader(String name) {
-        final JournalReader<Document> reader = journalReaders.computeIfAbsent(name, (key) -> {
+    public Completes<JournalReader<DocumentEntry>> journalReader(String name) {
+        final JournalReader<DocumentEntry> reader = journalReaders.computeIfAbsent(name, (key) -> {
             Address address = stage().world().addressFactory().uniquePrefixedWith("eventJournalReader-" + name);
             return stage().actorFor(
                     JournalReader.class,
@@ -177,47 +207,45 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
         return completes().with(reader);
     }
 
-    public <S extends Source<?>, E extends Entry<?>> void registerEntryAdapter(Class<S> aClass, EntryAdapter<S, E> entryAdapter) {
-//        throw new UnsupportedOperationException("Register Adapters in SourcedTypeRegistry only");
-        entryAdapters.put(aClass, (EntryAdapter<Source<?>, Entry<Document>>) entryAdapter);
-
-    }
-
-    public <S, R extends State<?>> void registerStateAdapter(Class<S> aClass, StateAdapter<S, R> stateAdapter) {
-//        throw new UnsupportedOperationException("Register Adapters in SourcedTypeRegistry only");
-        stateAdapters.put(aClass, (StateAdapter<?, State<Document>>) stateAdapter);
-    }
+//    @Override
+//    public <S extends Source<?>, E extends Entry<?>> void registerEntryAdapter(Class<S> aClass, EntryAdapter<S, E> entryAdapter) {
+////        throw new UnsupportedOperationException("Register Adapters in SourcedTypeRegistry only");
+//        entryAdapters.put(aClass, (EntryAdapter<Source<?>, Entry<Document>>) entryAdapter);
+//
+//    }
+//
+//    @Override
+//    public <S, R extends State<?>> void registerStateAdapter(Class<S> aClass, StateAdapter<S, R> stateAdapter) {
+////        throw new UnsupportedOperationException("Register Adapters in SourcedTypeRegistry only");
+//        stateAdapters.put(aClass, (StateAdapter<?, State<Document>>) stateAdapter);
+//    }
 
     private Entry<Document> asEntry(Source<?> source) {
 //        final SourcedTypeRegistry sourcedTypeRegistry = getSourcedTypeRegistry();
 //        final Entry<?> entry = sourcedTypeRegistry.info(SOURCED_CLASS_MISSING).entryAdapterProvider.asEntry(source);
-        if (!entryAdapters.containsKey(source.getClass())) {
-            throw new IllegalStateException(String.format("No EntryAdapter for source '%s' found", source.getClass()));
-        }
+//        if (!entryAdapters.containsKey(source.getClass())) {
+//            throw new IllegalStateException(String.format("No EntryAdapter for source '%s' found", source.getClass()));
+//        }
 
-        final Entry<?> entry = entryAdapters.get(source.getClass()).toEntry(source);
+        final Entry<?> entry = new DefaultDocumentEntryAdapter<>().toEntry(source);//)entryAdapters.get(source.getClass()).toEntry(source);
 
-        if (!(entry.entryData instanceof Document)) {
-            throw new IllegalStateException(String.format("entryData must be from type '%s' but was '%s'", Document.class, entry.entryData.getClass()));
+        if (!(entry.entryData() instanceof Document)) {
+            throw new IllegalStateException(String.format("entryData must be from type '%s' but was '%s'", Document.class, entry.entryData().getClass()));
         }
 
         return (Entry<Document>) entry;
-    }
-
-    private SourcedTypeRegistry getSourcedTypeRegistry() {
-        return stage().world().resolveDynamic(SourcedTypeRegistryName.NAME, SourcedTypeRegistry.class);
     }
 
     private State<Document> asState(int streamVersion, Object snapshot) {
 //        final SourcedTypeRegistry sourcedTypeRegistry = getSourcedTypeRegistry();
 //        final State<?> state = sourcedTypeRegistry.info(SOURCED_CLASS_MISSING).stateAdapterProvider().asRaw(snapshot, streamVersion);
 
-        if (!stateAdapters.containsKey(snapshot.getClass())) {
-            throw new IllegalStateException(String.format("No StateAdapter for source '%s' found", snapshot.getClass()));
-        }
+//        if (!stateAdapters.containsKey(snapshot.getClass())) {
+//            throw new IllegalStateException(String.format("No StateAdapter for source '%s' found", snapshot.getClass()));
+//        }
 
-        final StateAdapter<Object, State<Document>> stateAdapter = (StateAdapter<Object, State<Document>>) stateAdapters.get(snapshot.getClass());
-        final State<?> state = stateAdapter.toRawState(snapshot, streamVersion);
+//        final StateAdapter<Object, State<Document>> stateAdapter = (StateAdapter<Object, State<Document>>) stateAdapters.get(snapshot.getClass());
+        final State<?> state = new DefaultDocumentStateAdapter<>().toRawState(snapshot, streamVersion);
 
         if (!(state.data instanceof Document)) {
             throw new IllegalStateException(String.format("data  must be from type '%s' but was '%s'", Document.class, state.data.getClass()));

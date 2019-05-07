@@ -24,9 +24,9 @@ public class DefaultDocumentStateAdapter<T> implements StateAdapter<T, State<Doc
         this.typeVersion = typeVersion;
     }
 
-    private Class<?> sourceType(State<Document> entry) {
+    private Class<T> sourceType(State<Document> entry) {
         try {
-            return Class.forName(entry.type);
+            return (Class<T>) Class.forName(entry.type);
         } catch (ClassNotFoundException e) {
             throw new IllegalStateException(String.format("Could not load Class '%s' from classpath", entry.type), e);
         } catch (ClassCastException e) {
@@ -41,16 +41,16 @@ public class DefaultDocumentStateAdapter<T> implements StateAdapter<T, State<Doc
 
     @Override
     public T fromRawState(State<Document> state) {
-        return (T) gson.fromJson(state.data.getString("json"), sourceType(state));
+        return fromRawState(state, sourceType(state));
     }
 
     @Override
-    public State<Document> toRawState(Object state, int stateVersion, Metadata metadata) {
-        return new DocumentState(state.getClass(), typeVersion, new Document("json", gson.toJson(state)), stateVersion, metadata);
+    public <ST> ST fromRawState(State<Document> state, Class<ST> stateType) {
+        return gson.fromJson(state.data.getString("json"), stateType);
     }
 
     @Override
-    public State<Document> toRawState(Object state, int stateVersion) {
-        return toRawState(state, stateVersion, Metadata.nullMetadata());
+    public State<Document> toRawState(String id, T state, int stateVersion, Metadata metadata) {
+        return new DocumentState(id, state.getClass(), typeVersion, new Document("json", gson.toJson(state)), stateVersion, metadata);
     }
 }

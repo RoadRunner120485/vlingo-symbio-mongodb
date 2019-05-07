@@ -1,15 +1,18 @@
-package io.vlingo.symbio.store.mongodb.journal;
+package io.vlingo.symbio.store.mongodb.journal.reader;
 
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.vlingo.common.Completes;
 import io.vlingo.common.Tuple2;
+import io.vlingo.symbio.BaseEntry;
 import io.vlingo.symbio.Entry;
 import io.vlingo.symbio.State;
 import io.vlingo.symbio.store.journal.Stream;
 import io.vlingo.symbio.store.journal.StreamReader;
 import io.vlingo.symbio.store.mongodb.Configuration;
+import io.vlingo.symbio.store.mongodb.journal.DocumentState;
+import io.vlingo.symbio.store.mongodb.journal.MongoDBJournalActor;
 import org.bson.Document;
 
 import java.util.Collections;
@@ -43,7 +46,7 @@ public class MongoDBStreamReaderActor extends AbstractMongoJournalReadingActor i
         if (entries.isEmpty() && !state.isPresent()) {
             return completes().with(unknownStream(streamName));
         } else {
-            return completes().with(new Stream<>(streamName, streamVersion + entries.size(), entries, state.orElse(DocumentState.Null)));
+            return completes().with(new Stream<>(streamName, streamVersion + entries.size(), cast(entries), state.orElse(DocumentState.Null)));
         }
     }
 
@@ -54,8 +57,12 @@ public class MongoDBStreamReaderActor extends AbstractMongoJournalReadingActor i
     public Completes<Stream<Document>> streamFor(String streamName, int streamVersion) {
         final List<Entry<Document>> entries = entriesFromVersion(streamName, streamVersion);
 
+        return completes().with(new Stream<>(streamName, streamVersion + entries.size(), cast(entries), DocumentState.Null));
+    }
 
-        return completes().with(new Stream<>(streamName, streamVersion + entries.size(), entries, DocumentState.Null));
+    @SuppressWarnings("unchecked")
+    private List<BaseEntry<Document>> cast(List<? extends Entry<Document>> entries) {
+        return (List<BaseEntry<Document>>) entries;
     }
 
     private List<Entry<Document>> entriesFromVersion(String streamName, int streamVersion) {
@@ -64,7 +71,8 @@ public class MongoDBStreamReaderActor extends AbstractMongoJournalReadingActor i
         return StreamSupport.stream(documents.spliterator(), false)
                 .flatMap(document -> document.getList("entries", Document.class).stream())
                 .filter(entry -> entry.getInteger("streamVersion") >= streamVersion)
-                .map(entry -> Tuple2.from(entry.getInteger("streamVersion"), asEntry(entry)))
+                // TODO Fix ID
+                .map(entry -> Tuple2.from(entry.getInteger("streamVersion"), asEntry("FIXME", entry)))
                 .sorted(Comparator.comparingInt(tuple -> tuple._1))
                 .map(t -> t._2)
                 .collect(Collectors.toList());

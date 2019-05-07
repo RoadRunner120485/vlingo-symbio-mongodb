@@ -21,18 +21,18 @@ public class DefaultDocumentEntryAdapter<T extends Source<?>> implements EntryAd
 
     @Override
     public T fromEntry(Entry<Document> entry) {
-        return (T) gson.fromJson(entry.entryData.getString("json"), sourceType(entry));
+        return (T) gson.fromJson(entry.entryData().getString("json"), sourceType(entry));
     }
 
     @SuppressWarnings("unchecked")
     private Class<Source<?>> sourceType(Entry<Document> entry) {
         Class<Source<?>> entryType;
         try {
-            entryType = (Class<Source<?>>) Class.forName(entry.type);
+            entryType = (Class<Source<?>>) Class.forName(entry.type());
         } catch (ClassNotFoundException e) {
-            throw new IllegalStateException(String.format("Could not load Class '%s' from classpath", entry.type), e);
+            throw new IllegalStateException(String.format("Could not load Class '%s' from classpath", entry.type()), e);
         } catch (ClassCastException e) {
-            throw new IllegalStateException(String.format("Class '%s' is not a subclass of Source<?>", entry.type), e);
+            throw new IllegalStateException(String.format("Class '%s' is not a subclass of Source<?>", entry.type()), e);
         }
         return entryType;
     }

@@ -1,20 +1,20 @@
-package io.vlingo.symbio.store.mongodb.journal;
+package io.vlingo.symbio.store.mongodb.journal.reader;
 
 import com.google.gson.Gson;
 import io.vlingo.actors.Actor;
 import io.vlingo.symbio.Entry;
 import io.vlingo.symbio.Metadata;
 import io.vlingo.symbio.State;
+import io.vlingo.symbio.store.mongodb.journal.DocumentEntry;
+import io.vlingo.symbio.store.mongodb.journal.DocumentState;
 import org.bson.Document;
-import org.bson.types.ObjectId;
 
 abstract class AbstractMongoJournalReadingActor extends Actor {
 
     private final Gson gson = new Gson();
 
-    protected Entry<Document> asEntry(Document event) {
+    protected Entry<Document> asEntry(String id, Document event) {
         try {
-            ObjectId id = event.get("_id", ObjectId.class);
             String metadata = event.getString("metadata");
             Document entryData = event.get("document", Document.class);
             String type = event.getString("type");
@@ -22,7 +22,7 @@ abstract class AbstractMongoJournalReadingActor extends Actor {
 
             Class<?> clazz = Class.forName(type);
 
-            return new DocumentEntry(id.toString(), clazz, typeVersion, entryData, gson.fromJson(metadata, Metadata.class));
+            return new DocumentEntry(id, clazz, typeVersion, entryData, gson.fromJson(metadata, Metadata.class));
         } catch (ClassNotFoundException e) {
             throw new RuntimeException(e);
         }
