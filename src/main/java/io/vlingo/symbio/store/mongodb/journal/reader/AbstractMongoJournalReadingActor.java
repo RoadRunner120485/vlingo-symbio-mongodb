@@ -1,44 +1,36 @@
 package io.vlingo.symbio.store.mongodb.journal.reader;
 
-import com.google.gson.Gson;
 import io.vlingo.actors.Actor;
 import io.vlingo.symbio.Entry;
-import io.vlingo.symbio.Metadata;
 import io.vlingo.symbio.State;
-import io.vlingo.symbio.store.mongodb.journal.DocumentEntry;
-import io.vlingo.symbio.store.mongodb.journal.DocumentState;
+import io.vlingo.symbio.store.mongodb.journal.adapter.DocumentEntry;
+import io.vlingo.symbio.store.mongodb.journal.adapter.DocumentState;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter;
 import org.bson.Document;
 
 abstract class AbstractMongoJournalReadingActor extends Actor {
 
-    private final Gson gson = new Gson();
 
-    protected Entry<Document> asEntry(String id, Document event) {
+    protected Entry<Document> asEntry(JournalDocumentAdapter.JournalDocumentEntry event) {
         try {
-            String metadata = event.getString("metadata");
-            Document entryData = event.get("document", Document.class);
-            String type = event.getString("type");
-            int typeVersion = event.getInteger("typeVersion");
+            Document entryData = event.getEntry();
+            String type = event.getType();
+            int typeVersion = event.getTypeVersion();
 
             Class<?> clazz = Class.forName(type);
 
-            return new DocumentEntry(id, clazz, typeVersion, entryData, gson.fromJson(metadata, Metadata.class));
+            return new DocumentEntry(event.getId(), clazz, typeVersion, entryData, event.getMetadata());
         } catch (ClassNotFoundException e) {
             throw new RuntimeException(e);
         }
     }
 
-    protected State<Document> asState(String streamName, Document stateDocument) {
+    protected State<Document> asState(String streamName, JournalDocumentAdapter.JournalDocumentState stateDocument) {
         try {
-            Document metadata = stateDocument.get("metadata", Document.class);
-            Document data = stateDocument.get("document", Document.class);
-            String type = stateDocument.getString("type");
-            int typeVersion = stateDocument.getInteger("typeVersion");
-            int dataVersion = stateDocument.getInteger("dataVersion");
 
-            Class<?> clazz = Class.forName(type);
+            Class<?> clazz = Class.forName(stateDocument.getType());
 
-            return new DocumentState(streamName, clazz, typeVersion, data, dataVersion, gson.fromJson(metadata.toJson(), Metadata.class));
+            return new DocumentState(streamName, clazz, stateDocument.getTypeVersion(), stateDocument.getState(), stateDocument.getDataVersion(), stateDocument.getMetadata());
         } catch (ClassNotFoundException e) {
             throw new RuntimeException(e);
         }

@@ -29,7 +29,7 @@ public class Configuration {
         return client;
     }
 
-    public String datebaseName() {
+    public String databaseName() {
         return databaseName;
     }
 

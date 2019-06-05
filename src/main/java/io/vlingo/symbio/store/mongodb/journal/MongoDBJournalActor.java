@@ -1,42 +1,48 @@
 package io.vlingo.symbio.store.mongodb.journal;
 
-import com.google.gson.Gson;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
 import io.vlingo.actors.Actor;
 import io.vlingo.actors.Address;
 import io.vlingo.actors.Definition;
 import io.vlingo.common.Completes;
+import io.vlingo.common.Failure;
+import io.vlingo.common.Outcome;
 import io.vlingo.common.Success;
 import io.vlingo.common.Tuple2;
 import io.vlingo.symbio.Entry;
-import io.vlingo.symbio.EntryAdapter;
 import io.vlingo.symbio.Source;
 import io.vlingo.symbio.State;
-import io.vlingo.symbio.StateAdapter;
 import io.vlingo.symbio.store.Result;
+import io.vlingo.symbio.store.StorageException;
 import io.vlingo.symbio.store.journal.Journal;
 import io.vlingo.symbio.store.journal.JournalListener;
 import io.vlingo.symbio.store.journal.JournalReader;
 import io.vlingo.symbio.store.journal.StreamReader;
 import io.vlingo.symbio.store.mongodb.Configuration;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter.JournalDocumentEntry;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter.JournalDocumentSequence;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter.JournalDocumentState;
+import io.vlingo.symbio.store.mongodb.journal.adapter.DefaultDocumentEntryAdapter;
+import io.vlingo.symbio.store.mongodb.journal.adapter.DefaultDocumentStateAdapter;
+import io.vlingo.symbio.store.mongodb.journal.adapter.DocumentEntry;
 import io.vlingo.symbio.store.mongodb.journal.reader.MongoDBJournalReaderActor;
 import io.vlingo.symbio.store.mongodb.journal.reader.MongoDBStreamReaderActor;
 import io.vlingo.symbio.store.mongodb.journal.reader.SequenceOffset;
 import org.bson.Document;
-import org.bson.types.ObjectId;
 
 import java.time.Clock;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
+
+import static java.util.stream.Collectors.toList;
 
 public class MongoDBJournalActor extends Actor implements Journal<Document> {
 
@@ -51,25 +57,22 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
 
     private final Map<String, JournalReader<DocumentEntry>> journalReaders;
     private final Map<String, StreamReader<Document>> streamReaders;
-    private final Map<Class<?>, EntryAdapter<Source<?>, Entry<Document>>> entryAdapters;
-    private final Map<Class<?>, StateAdapter<?, State<Document>>> stateAdapters;
 
     private final JournalListener<Document> journalListener;
-
-    private final Gson gson = new Gson();
 
     public MongoDBJournalActor(JournalListener<Document> journalListener, Configuration configuration) {
         this.configuration = configuration;
 
-        final MongoDatabase database = configuration.client().getDatabase(configuration.datebaseName());
+        final MongoDatabase database = configuration.client().getDatabase(configuration.databaseName());
         journal = database.getCollection(JOURNAL_COLLECTION_NAME).withWriteConcern(configuration.writeConcern());
+        journal.createIndex(new Document("sequence.id", 1).append("sequence.offset", 1), new IndexOptions().unique(true).name("_journal_unique_sequence_idx"));
+        journal.createIndex(new Document("streamName", 1).append("hasSnapshot", 1).append("streamVersionEnd", -1), new IndexOptions().name("_stream_reader_index"));
+        journal.createIndex(new Document("sequence.timestamp", 1).append("sequence.id", 1).append("sequence.offset", 1), new IndexOptions().name("_journal_reader_index"));
 
         this.journalListener = journalListener;
 
         this.journalReaders = new HashMap<>();
         this.streamReaders = new HashMap<>();
-        this.entryAdapters = new HashMap<>();
-        this.stateAdapters = new HashMap<>();
 
         initSequenceNumber(configuration.getJournalId());
     }
@@ -79,97 +82,116 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
         if (result == null) {
             this.sequencePointer = new SequenceOffset(journalId);
         } else {
-            long latestSequenceNumber = result.get("sequence", Document.class).getLong("offset");
+            long latestSequenceNumber = new JournalDocumentAdapter(result).getSequence().getOffset();
             this.sequencePointer = new SequenceOffset(journalId, latestSequenceNumber).next();
         }
     }
 
     public <S, ST> void append(String streamName, int fromStreamVersion, Source<S> source, AppendResultInterest interest, Object o) {
-        final Tuple2<List<Entry<Document>>, State<Document>> result = appendAllWithInternal(streamName, fromStreamVersion, Collections.singletonList(source), null);
-        interest.appendResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, source, Optional.empty(), o);
-        journalListener.appended(result._1.get(0));
+        appendAllWithInternal(streamName, fromStreamVersion, Collections.singletonList(source), null)
+                .resolve(
+                        error -> returnVoid(() ->
+                                interest.appendResultedIn(Failure.of(error), streamName, fromStreamVersion, source, Optional.empty(), o)
+                        ),
+                        success -> returnVoid(() -> {
+                            interest.appendResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, source, Optional.empty(), o);
+                            journalListener.appended(success._1.get(0));
+                        })
+                );
     }
 
     public <S, ST> void appendWith(String streamName, int fromStreamVersion, Source<S> source, ST snapshot, AppendResultInterest interest, Object o) {
-        final Tuple2<List<Entry<Document>>, State<Document>> result = appendAllWithInternal(streamName, fromStreamVersion, Collections.singletonList(source), snapshot);
-        interest.appendResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, source, Optional.ofNullable(snapshot), o);
-        journalListener.appendedWith(result._1.get(0), result._2);
+        appendAllWithInternal(streamName, fromStreamVersion, Collections.singletonList(source), snapshot)
+                .resolve(
+                        error -> returnVoid(() ->
+                                interest.appendResultedIn(Failure.of(error), streamName, fromStreamVersion, source, Optional.ofNullable(snapshot), o)
+                        ),
+                        success -> returnVoid(() -> {
+                            interest.appendResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, source, Optional.ofNullable(snapshot), o);
+                            journalListener.appendedWith(success._1.get(0), success._2.orElse(null));
+                        })
+                );
     }
 
     public <S, ST> void appendAll(String streamName, int fromStreamVersion, List<Source<S>> sources, AppendResultInterest interest, Object o) {
-        final Tuple2<List<Entry<Document>>, State<Document>> result = appendAllWithInternal(streamName, fromStreamVersion, sources, null);
-        interest.appendAllResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, sources, Optional.empty(), o);
-        journalListener.appendedAll(result._1);
+        appendAllWithInternal(streamName, fromStreamVersion, sources, null)
+                .resolve(
+                        error -> returnVoid(() ->
+                                interest.appendAllResultedIn(Failure.of(error), streamName, fromStreamVersion, sources, Optional.empty(), o)
+                        ),
+                        success -> returnVoid(() -> {
+                            interest.appendAllResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, sources, Optional.empty(), o);
+                            journalListener.appendedAll(success._1);
+                        })
+                );
     }
 
     public <S, ST> void appendAllWith(String streamName, int fromStreamVersion, List<Source<S>> sources, ST snapshot, AppendResultInterest interest, Object o) {
-        final Tuple2<List<Entry<Document>>, State<Document>> result = appendAllWithInternal(streamName, fromStreamVersion, sources, snapshot);
-        interest.appendAllResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, sources, Optional.ofNullable(snapshot), o);
-        journalListener.appendedAllWith(result._1, result._2);
+        appendAllWithInternal(streamName, fromStreamVersion, sources, snapshot).
+                resolve(
+                        error -> returnVoid(() ->
+                                interest.appendAllResultedIn(Failure.of(error), streamName, fromStreamVersion, sources, Optional.ofNullable(snapshot), o)
+                        ),
+                        success -> returnVoid(() -> {
+                                    interest.appendAllResultedIn(Success.of(Result.Success), streamName, fromStreamVersion, sources, Optional.ofNullable(snapshot), o);
+                                    journalListener.appendedAllWith(success._1, success._2.orElse(null));
+                                }
+                        )
+                );
     }
 
-    private <S, ST> Tuple2<List<Entry<Document>>, State<Document>> appendAllWithInternal(String streamName, int fromStreamVersion, List<Source<S>> sources, ST snapshot) {
-        final AtomicInteger version = new AtomicInteger(fromStreamVersion);
+    private <S, ST> Outcome<StorageException, Tuple2<List<Entry<Document>>, Optional<State<Document>>>> appendAllWithInternal(String streamName, int fromStreamVersion, List<Source<S>> sources, ST snapshot) {
+        try {
 
-        final List<Entry<Document>> entries = sources.stream()
-                .map(this::asEntry)
-                .collect(Collectors.toList());
+            final int maxVersion = fromStreamVersion + sources.size() - 1;
+            final AtomicInteger version = new AtomicInteger(fromStreamVersion);
 
-        final List<Document> documents = entries.stream()
-                .map(entry -> entryAsDocument(entry, version.getAndIncrement()))
-                .sorted(Comparator.comparingInt(doc -> doc.getInteger("streamVersion")))
-                .collect(Collectors.toList());
+            final List<Tuple2<Integer, Entry<Document>>> entries = sources.stream()
+                    .map(s -> {
+                        final int streamVersion = version.getAndIncrement();
+                        return Tuple2.from(streamVersion, this.asEntry(s, streamVersion));
+                    })
+                    .collect(toList());
 
-        final int maxVersion = version.get() - 1;
+            final State<Document> state = snapshot == null ? null : asState(fromStreamVersion, snapshot);
 
-        final Document combinedDocument = new Document("streamName", streamName)
-                .append("sequence", new Document("timestamp", clock.millis()).append("id", sequencePointer.getId()).append("offset", sequencePointer.getOffset()))
-                .append("streamVersionStart", fromStreamVersion)
-                .append("streamVersionEnd", maxVersion)
-                .append("entries", documents)
-                .append("hasSnapshot", snapshot != null);
+            final JournalDocumentAdapter dbDocument = new JournalDocumentAdapter(
+                    streamName,
+                    JournalDocumentSequence.fromSequenceOffset(clock.millis(), sequencePointer),
+                    fromStreamVersion,
+                    maxVersion,
+                    entries.stream()
+                            .map(tuple -> JournalDocumentEntry.fromEntry(tuple._2, tuple._1))
+                            .collect(toList()),
+                    state == null ? null : JournalDocumentState.fromState(state)
+            );
 
-        State<Document> state = null;
-        if (snapshot != null) {
-            state = asState(fromStreamVersion, snapshot);
-            combinedDocument
-                    .append("state", new Document("document", state.data)
-                            .append("type", state.type)
-                            .append("dataVersion", state.dataVersion)
-                            .append("typeVersion", state.typeVersion)
-                            .append("metadata", asJson(state.metadata))
-                    );
+            final Document filter = new Document("streamName", streamName)
+                    .append("streamVersionEnd", new Document("$gte", fromStreamVersion));
+            final Document update = new Document("$setOnInsert", dbDocument.getDocument());
+
+            final UpdateResult updateResult = journal.updateOne(filter, update, new UpdateOptions().upsert(true));
+
+            if (updateResult.getModifiedCount() > 0) {
+                // UH OH!
+                throw new StorageException(Result.Failure, "EventStream has been mutated! This should not happen. Please report issue!");
+            }
+
+            boolean success = updateResult.getUpsertedId() != null;
+
+
+            if (success) {
+                this.sequencePointer = sequencePointer.next();
+            } else {
+                throw new StorageException(Result.ConcurrentyViolation, String.format("StreamVersion %s already exits in Stream %s!", fromStreamVersion, streamName));
+            }
+
+            return Success.of(Tuple2.from(entries.stream().map(t -> t._2).collect(toList()), Optional.ofNullable(state)));
+        } catch (StorageException e) {
+            return Failure.of(e);
+        } catch (Exception e) {
+            return Failure.of(new StorageException(Result.Error, "Unexpected error occurred.", e));
         }
-
-        final Document filter = new Document("streamName", streamName)
-                .append("streamVersionEnd", new Document("$gte", fromStreamVersion));
-        final Document update = new Document("$setOnInsert", combinedDocument);
-
-        final UpdateResult updateResult = journal.updateOne(filter, update, new UpdateOptions().upsert(true));
-
-        boolean success = updateResult.getUpsertedId() != null;
-
-        if (success) {
-            this.sequencePointer = sequencePointer.next();
-        } else {
-            // TODO ERROR HANDLING!!!
-            throw new IllegalStateException("");
-        }
-
-        return Tuple2.from(entries, state);
-    }
-
-    private String asJson(Object source) {
-        return gson.toJson(source);
-    }
-
-    private Document entryAsDocument(Entry<Document> entry, int streamVersion) {
-        return new Document("_id", new ObjectId())
-                .append("streamVersion", streamVersion)
-                .append("typeVersion", entry.typeVersion())
-                .append("metadata", asJson(entry.metadata()))
-                .append("document", entry.entryData())
-                .append("type", entry.type());
     }
 
     @SuppressWarnings("unchecked")
@@ -207,27 +229,14 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
         return completes().with(reader);
     }
 
-//    @Override
-//    public <S extends Source<?>, E extends Entry<?>> void registerEntryAdapter(Class<S> aClass, EntryAdapter<S, E> entryAdapter) {
-////        throw new UnsupportedOperationException("Register Adapters in SourcedTypeRegistry only");
-//        entryAdapters.put(aClass, (EntryAdapter<Source<?>, Entry<Document>>) entryAdapter);
-//
-//    }
-//
-//    @Override
-//    public <S, R extends State<?>> void registerStateAdapter(Class<S> aClass, StateAdapter<S, R> stateAdapter) {
-////        throw new UnsupportedOperationException("Register Adapters in SourcedTypeRegistry only");
-//        stateAdapters.put(aClass, (StateAdapter<?, State<Document>>) stateAdapter);
-//    }
-
-    private Entry<Document> asEntry(Source<?> source) {
+    private Entry<Document> asEntry(Source<?> source, int streamVersion) {
 //        final SourcedTypeRegistry sourcedTypeRegistry = getSourcedTypeRegistry();
 //        final Entry<?> entry = sourcedTypeRegistry.info(SOURCED_CLASS_MISSING).entryAdapterProvider.asEntry(source);
 //        if (!entryAdapters.containsKey(source.getClass())) {
 //            throw new IllegalStateException(String.format("No EntryAdapter for source '%s' found", source.getClass()));
 //        }
-
-        final Entry<?> entry = new DefaultDocumentEntryAdapter<>().toEntry(source);//)entryAdapters.get(source.getClass()).toEntry(source);
+        final String id = String.format("%s-%s-%s", sequencePointer.getId(), sequencePointer.getOffset(), streamVersion);
+        final Entry<?> entry = new DefaultDocumentEntryAdapter<>().toEntry(source, id);//)entryAdapters.get(source.getClass()).toEntry(source);
 
         if (!(entry.entryData() instanceof Document)) {
             throw new IllegalStateException(String.format("entryData must be from type '%s' but was '%s'", Document.class, entry.entryData().getClass()));
@@ -252,6 +261,11 @@ public class MongoDBJournalActor extends Actor implements Journal<Document> {
         }
 
         return (State<Document>) state;
+    }
+
+    private static Void returnVoid(Runnable runnable) {
+        runnable.run();
+        return null;
     }
 
 }

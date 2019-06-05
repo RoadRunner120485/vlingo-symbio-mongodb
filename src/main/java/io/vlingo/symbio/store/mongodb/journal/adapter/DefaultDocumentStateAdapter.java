@@ -1,4 +1,4 @@
-package io.vlingo.symbio.store.mongodb.journal;
+package io.vlingo.symbio.store.mongodb.journal.adapter;
 
 import com.google.gson.Gson;
 import io.vlingo.symbio.Metadata;
@@ -12,7 +12,7 @@ public class DefaultDocumentStateAdapter<T> implements StateAdapter<T, State<Doc
     private final int typeVersion;
 
     public DefaultDocumentStateAdapter() {
-        this(0);
+        this(1);
     }
 
     public DefaultDocumentStateAdapter(int typeVersion) {

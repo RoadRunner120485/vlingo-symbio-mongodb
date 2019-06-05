@@ -1,4 +1,4 @@
-package io.vlingo.symbio.store.mongodb.journal;
+package io.vlingo.symbio.store.mongodb.journal.adapter;
 
 import io.vlingo.actors.World;
 

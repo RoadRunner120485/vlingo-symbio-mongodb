@@ -1,4 +1,4 @@
-package io.vlingo.symbio.store.mongodb.journal;
+package io.vlingo.symbio.store.mongodb.journal.adapter;
 
 import com.google.gson.Gson;
 import io.vlingo.symbio.Entry;
@@ -39,7 +39,7 @@ public class DefaultDocumentEntryAdapter<T extends Source<?>> implements EntryAd
 
     @Override
     public Entry<Document> toEntry(T source) {
-        return new DocumentEntry(source.getClass(), 1, new Document("json", gson.toJson(source)), Metadata.nullMetadata());
+        throw new UnsupportedOperationException();
     }
 
     @Override

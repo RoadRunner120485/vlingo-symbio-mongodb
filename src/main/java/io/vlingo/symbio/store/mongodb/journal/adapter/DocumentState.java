@@ -1,4 +1,4 @@
-package io.vlingo.symbio.store.mongodb.journal;
+package io.vlingo.symbio.store.mongodb.journal.adapter;
 
 import io.vlingo.symbio.Metadata;
 import io.vlingo.symbio.State;
@@ -8,25 +8,10 @@ public class DocumentState extends State<Document> {
 
     public static final DocumentState Null = new DocumentState();
 
-//    private static final Document EmptyStateData = new Document();
-
     private final Class<?> typeClass;
 
     public DocumentState(String id, Class<?> type, int typeVersion, Document data, int dataVersion, Metadata metadata) {
         super(id, type, typeVersion, data, dataVersion, metadata);
-        this.typeClass = type;
-    }
-
-    public DocumentState(Class<?> type, int typeVersion, Document data, int dataVersion, Metadata metadata) {
-        this(NoOp, type, typeVersion, data, dataVersion, metadata);
-    }
-
-    public DocumentState(Class<?> type, int typeVersion, Document data, int dataVersion) {
-        this(NoOp, type, typeVersion, data, dataVersion);
-    }
-
-    public DocumentState(String id, Class<?> type, int typeVersion, Document data, int dataVersion) {
-        super(id, type, typeVersion, data, dataVersion);
         this.typeClass = type;
     }
 

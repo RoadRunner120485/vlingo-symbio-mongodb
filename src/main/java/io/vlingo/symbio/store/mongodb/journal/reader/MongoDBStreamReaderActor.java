@@ -4,15 +4,16 @@ import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.vlingo.common.Completes;
-import io.vlingo.common.Tuple2;
 import io.vlingo.symbio.BaseEntry;
 import io.vlingo.symbio.Entry;
 import io.vlingo.symbio.State;
 import io.vlingo.symbio.store.journal.Stream;
 import io.vlingo.symbio.store.journal.StreamReader;
 import io.vlingo.symbio.store.mongodb.Configuration;
-import io.vlingo.symbio.store.mongodb.journal.DocumentState;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter.JournalDocumentEntry;
 import io.vlingo.symbio.store.mongodb.journal.MongoDBJournalActor;
+import io.vlingo.symbio.store.mongodb.journal.adapter.DocumentState;
 import org.bson.Document;
 
 import java.util.Collections;
@@ -29,7 +30,7 @@ public class MongoDBStreamReaderActor extends AbstractMongoJournalReadingActor i
 
     public MongoDBStreamReaderActor(String name, Configuration configuration) {
         this.name = name;
-        final MongoDatabase database = configuration.client().getDatabase(configuration.datebaseName());
+        final MongoDatabase database = configuration.client().getDatabase(configuration.databaseName());
         this.journal = database.getCollection(MongoDBJournalActor.JOURNAL_COLLECTION_NAME);
     }
 
@@ -39,7 +40,13 @@ public class MongoDBStreamReaderActor extends AbstractMongoJournalReadingActor i
                 .limit(1)
                 .first();
 
-        final Optional<State<Document>> state = Optional.ofNullable(snapshotDocument).map(d -> asState(streamName, d));
+        final Optional<State<Document>> state = Optional.ofNullable(snapshotDocument)
+                .map(JournalDocumentAdapter::new)
+                .flatMap(d ->
+                        d.getState()
+                                .map(stateAdapter -> asState(streamName, stateAdapter))
+                );
+
         final Integer streamVersion = state.map(s -> s.dataVersion).orElse(1);
         final List<Entry<Document>> entries = entriesFromVersion(streamName, streamVersion);
 
@@ -69,12 +76,11 @@ public class MongoDBStreamReaderActor extends AbstractMongoJournalReadingActor i
         final FindIterable<Document> documents = journal.find(new Document("streamName", streamName).append("streamVersionEnd", new Document("$gte", streamVersion))).sort(new Document("streamVersionEnd", 1));
 
         return StreamSupport.stream(documents.spliterator(), false)
-                .flatMap(document -> document.getList("entries", Document.class).stream())
-                .filter(entry -> entry.getInteger("streamVersion") >= streamVersion)
-                // TODO Fix ID
-                .map(entry -> Tuple2.from(entry.getInteger("streamVersion"), asEntry("FIXME", entry)))
-                .sorted(Comparator.comparingInt(tuple -> tuple._1))
-                .map(t -> t._2)
+                .map(JournalDocumentAdapter::new)
+                .flatMap(document -> document.getEntries().stream())
+                .filter(entry -> entry.getStreamVersion() >= streamVersion)
+                .sorted(Comparator.comparingInt(JournalDocumentEntry::getStreamVersion))
+                .map(this::asEntry)
                 .collect(Collectors.toList());
     }
 

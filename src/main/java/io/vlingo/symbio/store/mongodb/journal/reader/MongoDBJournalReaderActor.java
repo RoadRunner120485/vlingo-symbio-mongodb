@@ -10,6 +10,9 @@ import io.vlingo.common.Completes;
 import io.vlingo.common.Tuple2;
 import io.vlingo.symbio.Entry;
 import io.vlingo.symbio.store.mongodb.Configuration;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter.JournalDocumentEntry;
+import io.vlingo.symbio.store.mongodb.journal.JournalDocumentAdapter.JournalDocumentSequence;
 import org.bson.Document;
 
 import java.util.ArrayList;
@@ -19,8 +22,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
-import java.util.stream.IntStream;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
@@ -33,22 +35,23 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
     static final String JOURNAL_OFFSETS_COLLECTION_NAME = "symbio_journal_offsets";
 
     private final String name;
-    private final GapResolver gapResolver;
-    private CursorToken currentCursorToken;
 
     private final MongoCollection<Document> journalOffsets;
     private final MongoCollection<Document> journal;
 
+    private CursorToken currentCursorToken;
+
+    private final GapResolver gapResolver;
+
     public MongoDBJournalReaderActor(String name, Configuration configuration) {
         this.name = name;
 
-        final MongoDatabase database = configuration.client().getDatabase(configuration.datebaseName());
+        final MongoDatabase database = configuration.client().getDatabase(configuration.databaseName());
         this.journal = database.getCollection(JOURNAL_COLLECTION_NAME);
         this.journalOffsets = database.getCollection(JOURNAL_OFFSETS_COLLECTION_NAME).withWriteConcern(configuration.writeConcern());
 
         initCurrentCursorToken();
 
-//        gapResolver = stage().actorFor(GapResolver.class, Definition.has(GapResolverActor.class, Definition.parameters(this.name)));
         gapResolver = new TimeoutGapResolver(journal, 5, TimeUnit.SECONDS);
     }
 
@@ -58,7 +61,7 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         if (result == null) {
             this.currentCursorToken = CursorToken.beginning();
         } else {
-            this.currentCursorToken = CURSOR_SERIALIZER.fromJson(result.getString("data"), CursorToken.class); // Tuple3.from(result.getObjectId("offsetId"), result.getInteger("offsetIndex"), result.getBoolean("hasMoreEntries"));
+            this.currentCursorToken = CURSOR_SERIALIZER.fromJson(result.getString("data"), CursorToken.class);
         }
     }
 
@@ -67,32 +70,42 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
     }
 
     public Completes<Entry<Document>> readNext() {
-        return readNext(1)
-                .andThen(list -> list.size() == 1 ? list.get(0) : null);
+        final List<Entry<Document>> result = readNextInternal(1, entries -> {
+            if (entries.size() > 1) {
+                throw new IllegalStateException();
+            }
+        });
+        if (result.isEmpty()) {
+            return completes().with(null);
+        } else {
+            return completes().with(result.get(0));
+        }
     }
 
     public Completes<List<Entry<Document>>> readNext(int maxCount) {
-        final List<Entry<Document>> result = new ArrayList<>(maxCount);
-        final List<Tuple2<SequenceOffset, Optional<Document>>> resolvedGaps = gapResolver.resolveGaps(currentCursorToken, maxCount);
+        return completes().with(readNextInternal(maxCount, entries -> {}));
+    }
 
-        final Tuple2<CursorToken, List<Entry<Document>>> gapEntriesTuple = handleResolvedGaps(resolvedGaps);
-        result.addAll(gapEntriesTuple._2);
+    private List<Entry<Document>> readNextInternal(int maxCount, Consumer<List<Entry<Document>>> verifier) {
+        final List<ResolvedGap> resolvedGaps = gapResolver.resolveGaps(currentCursorToken, maxCount);
+        final List<Entry<Document>> gapEntries = handleResolved(resolvedGaps);
 
         int maxEntries = maxCount - resolvedGaps.size();
 
-        CursorToken batchToken = gapEntriesTuple._1;
+        final List<Entry<Document>> result = new ArrayList<>(maxCount);
+        result.addAll(gapEntries);
+
+        CursorToken batchToken = currentCursorToken.resolved(resolvedGaps);
         boolean queryCurrentTokenDocument = batchToken.hasCurrentDocumentMoreEntries();
 
         MongoCursor<Document> iterator = getDocumentIterator(maxEntries, batchToken, queryCurrentTokenDocument);
-        while (iterator.hasNext() && result.size() < maxEntries) {
-            final Document nextDocument = iterator.next();
-            batchToken = batchToken.hasCurrentDocumentMoreEntries() ? batchToken : nextBatchToken(batchToken, nextDocument);
-            final List<Document> entries = nextDocument.getList("entries", Document.class);
-            while (batchToken.hasCurrentDocumentMoreEntries() && result.size() < maxEntries) {
-                final Integer idx = batchToken.getCurrentDocumentIndex();
-                final String id = asEntryIdString(batchToken.getCurrentDocumentOffset(), idx);
 
-                result.add(asEntry(id, entries.get(batchToken.getCurrentDocumentIndex())));
+        while (iterator.hasNext() && result.size() < maxEntries) {
+            final JournalDocumentAdapter nextDocument = new JournalDocumentAdapter(iterator.next());
+            batchToken = batchToken.hasCurrentDocumentMoreEntries() ? batchToken : nextBatchToken(batchToken, nextDocument);
+            final List<JournalDocumentEntry> entries = nextDocument.getEntries();
+            while (batchToken.hasCurrentDocumentMoreEntries() && result.size() < maxEntries) {
+                result.add(asEntry(entries.get(batchToken.getCurrentDocumentIndex())));
                 batchToken = batchToken.nextIndex();
             }
             if (queryCurrentTokenDocument) {
@@ -100,31 +113,18 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
                 queryCurrentTokenDocument = false;
             }
         }
+        verifier.accept(result);
         updateCurrentCursorToken(batchToken);
-        return completes().with(result);
+        return result;
     }
 
-    private Tuple2<CursorToken, List<Entry<Document>>> handleResolvedGaps(List<Tuple2<SequenceOffset, Optional<Document>>> resolvedGaps) {
-        final Function<Document, Stream<Entry<Document>>> documentMapper = document -> {
-            final String sequence = document.getString("sequence.id");
-            final Long offset = document.getLong("sequence.offset");
-            final List<Document> entries = document.getList("entries", Document.class);
-            return IntStream.range(0, entries.size())
-                    .boxed()
-                    .map(i -> asEntry(asEntryIdString(new SequenceOffset(sequence, offset), i), entries.get(i)));
-        };
-
-
-        final Set<SequenceOffset> gapOffsets = new HashSet<>();
-        final List<Entry<Document>> result = resolvedGaps.stream()
-                .peek(tuple -> gapOffsets.add(tuple._1))
-                .map(tuple -> tuple._2)
+    private List<Entry<Document>> handleResolved(List<ResolvedGap> gaps) {
+        return gaps.stream()
+                .map(ResolvedGap::getData)
                 .filter(Optional::isPresent)
                 .map(Optional::get)
-                .flatMap(documentMapper)
+                .flatMap(d -> d.getEntries().stream().map(this::asEntry))
                 .collect(toList());
-
-        return Tuple2.from(currentCursorToken.removeGaps(gapOffsets), result);
     }
 
     private MongoCursor<Document> getDocumentIterator(int maxEntries, CursorToken batchToken, boolean queryCurrentTokenDocument) {
@@ -132,9 +132,9 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         final List<String> knownSequenceIds = new ArrayList<>();
 
         if (queryCurrentTokenDocument) {
-            subQueries.add(new Document("sequence.id", batchToken.getCurrentDocumentOffset().getId()).append("sequence.offset", batchToken.getCurrentDocumentOffset().getOffset()));
+            subQueries.add(JournalDocumentAdapter.queryFor(batchToken.getCurrentDocumentOffset()));
         } else {
-            currentCursorToken.forEachSequence((pointer, isCurrent) -> {
+            currentCursorToken.forEachSequenceHead((pointer, isCurrent) -> {
                 knownSequenceIds.add(pointer.getId());
                 subQueries.add(
                         new Document("sequence.id", pointer.getId())
@@ -149,15 +149,15 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         return journal.find(query).sort(new Document("sequence", 1)).limit(maxEntries).iterator();
     }
 
-    private static CursorToken nextBatchToken(CursorToken batchToken, Document nextDocument) {
+    private static CursorToken nextBatchToken(CursorToken batchToken, JournalDocumentAdapter nextDocument) {
         final SequenceOffset nextSequencePointer = extractSequenceOffset(nextDocument);
-        final List<Document> entries = nextDocument.getList("entries", Document.class);
+        final List<JournalDocumentEntry> entries = nextDocument.getEntries();
 
         final Set<SequenceOffset> gaps = batchToken.findGaps(nextSequencePointer);
 
         return batchToken
                 .withCurrentDocumentOffset(nextSequencePointer, 0, entries.size())
-                .addGaps(gaps);
+                .detected(gaps);
     }
 
     public void rewind() {
@@ -181,7 +181,7 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
                 return parseSequenceId(id)
                         .map(validPointer -> {
                             final SequenceOffset offset = validPointer._1;
-                            final Document documentForOffset = journal.find(new Document("sequence.id", offset.getId()).append("sequence.offset", offset.getOffset())).first();
+                            final Document documentForOffset = journal.find(JournalDocumentAdapter.queryFor(offset)).first();
                             if (documentForOffset == null) {
                                 return seekToEnd();
                             }
@@ -202,10 +202,10 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         }
     }
 
-    private static SequenceOffset extractSequenceOffset(Document entry) {
-        final Document sequence = entry.get("sequence", Document.class);
-        final String sequenceId = sequence.getString("id");
-        final Long sequenceOffset = sequence.getLong("offset");
+    private static SequenceOffset extractSequenceOffset(JournalDocumentAdapter entry) {
+        final JournalDocumentSequence sequence = entry.getSequence();
+        final String sequenceId = sequence.getId();
+        final Long sequenceOffset = sequence.getOffset();
         return new SequenceOffset(sequenceId, sequenceOffset);
     }
 
@@ -246,7 +246,7 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         final Document first = journal.find().sort(new Document("sequence.timestamp", 1)).first();
         if (first == null) return completes().with(null);
         rewind();
-        final SequenceOffset sequenceOffset = extractSequenceOffset(first);
+        final SequenceOffset sequenceOffset = extractSequenceOffset(new JournalDocumentAdapter(first));
         return completes().with(asEntryIdString(sequenceOffset, 0));
     }
 
@@ -256,10 +256,10 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         final CursorToken.CursorTokenBuilder builder = CursorToken.builder();
         Arrays.stream(offsets)
                 .map(SequenceOffset::previous)
-                .forEach(offset -> builder.topOfSequencePointer(offset.getId(), offset));
+                .forEach(offset -> builder.sequenceHead(offset.getId(), offset));
         final CursorToken token = builder.build();
         updateCurrentCursorToken(token);
-        return completes().with(new HashSet<>(token.getTopOfSequencePointers().values()));
+        return completes().with(new HashSet<>(token.getSequenceHeads().values()));
     }
 
     private void updateCurrentCursorToken(CursorToken newCurrent) {
@@ -270,10 +270,6 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
 
     private void writeCurrentToken(CursorToken newCurrent) {
         journalOffsets.updateMany(new Document("_id", this.name), new Document("$set", new Document("data", CURSOR_SERIALIZER.toJson(newCurrent))), new UpdateOptions().upsert(true));
-    }
-
-    private Stream<SequenceOffset> getMaxOffsets() {
-        return getMaxOffsets(null);
     }
 
     private Stream<SequenceOffset> getMaxOffsets(Document filter) {

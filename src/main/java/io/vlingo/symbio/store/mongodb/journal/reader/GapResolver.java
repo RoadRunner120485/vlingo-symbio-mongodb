@@ -1,12 +1,14 @@
 package io.vlingo.symbio.store.mongodb.journal.reader;
 
-import io.vlingo.common.Tuple2;
-import org.bson.Document;
-
 import java.util.List;
-import java.util.Optional;
 
+/**
+ * A {@link GapResolver} resolves detected when the corresponding {@link io.vlingo.symbio.Entry} was found in Journal
+ * or just marks it as resolved if one could safely assume that a corresponding {@link io.vlingo.symbio.Entry} has never
+ * been written to Journal.
+ */
 public interface GapResolver {
 
-    List<Tuple2<SequenceOffset, Optional<Document>>> resolveGaps(CursorToken token, int maxEntries);
+    List<ResolvedGap> resolveGaps(DetectedGapsProvider provider, int maxEntries);
+
 }

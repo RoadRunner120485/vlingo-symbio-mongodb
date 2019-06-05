@@ -9,6 +9,7 @@ import lombok.experimental.Wither;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiConsumer;
@@ -16,23 +17,25 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
+import static java.util.stream.Collectors.toSet;
+
 @Value
-public class CursorToken {
+public class CursorToken implements DetectedGapsProvider {
 
     private final SequenceOffset currentDocumentOffset;
     @Wither
     private final int currentDocumentIndex;
     private final int currentDocumentSize;
-    private final Map<String, SequenceOffset> topOfSequencePointers;
-    private final Set<SequenceOffset> gaps;
+    private final Map<String, SequenceOffset> sequenceHeads;
+    private final Set<SequenceOffset> detectedGaps;
 
     @Builder(toBuilder = true)
-    private CursorToken(SequenceOffset currentDocumentOffset, int currentDocumentIndex, int currentDocumentSize, @NonNull @Singular Map<String, SequenceOffset> topOfSequencePointers, @Singular Set<SequenceOffset> gaps) {
+    private CursorToken(SequenceOffset currentDocumentOffset, int currentDocumentIndex, int currentDocumentSize, @NonNull @Singular Map<String, SequenceOffset> sequenceHeads, @Singular Set<SequenceOffset> detectedGaps) {
         this.currentDocumentOffset = currentDocumentOffset;
         this.currentDocumentIndex = currentDocumentIndex;
         this.currentDocumentSize = currentDocumentSize;
-        this.topOfSequencePointers = Collections.unmodifiableMap(topOfSequencePointers);
-        this.gaps = gaps == null ? Collections.emptySet() : Collections.unmodifiableSet(gaps);
+        this.sequenceHeads = Collections.unmodifiableMap(sequenceHeads);
+        this.detectedGaps = detectedGaps == null ? Collections.emptySet() : Collections.unmodifiableSet(detectedGaps);
     }
 
     public static CursorToken withSequenceOffsets(SequenceOffset... offsets) {
@@ -48,7 +51,7 @@ public class CursorToken {
                 .currentDocumentOffset(currentDocumentOffset)
                 .currentDocumentIndex(currentDocumentIndex)
                 .currentDocumentSize(currentDocumentSize)
-                .topOfSequencePointer(currentDocumentOffset.getId(), currentDocumentOffset)
+                .sequenceHead(currentDocumentOffset.getId(), currentDocumentOffset)
                 .build();
     }
 
@@ -69,7 +72,7 @@ public class CursorToken {
     }
 
     public Set<SequenceOffset> findGaps(SequenceOffset nextOffset) {
-        final SequenceOffset knownTopOfSequence = topOfSequencePointers.get(nextOffset.getId());
+        final SequenceOffset knownTopOfSequence = sequenceHeads.get(nextOffset.getId());
         final long nextExpectedSequenceNumber = knownTopOfSequence == null ? 1L : knownTopOfSequence.next().getOffset();
 
         final boolean hasGaps = nextExpectedSequenceNumber < nextOffset.getOffset();
@@ -77,7 +80,7 @@ public class CursorToken {
         if (hasGaps) {
             return LongStream.range(nextExpectedSequenceNumber, nextOffset.getOffset())
                     .mapToObj(nextOffset::seekTo)
-                    .collect(Collectors.toSet());
+                    .collect(toSet());
         } else {
             return Collections.emptySet();
         }
@@ -88,42 +91,45 @@ public class CursorToken {
                 .currentDocumentOffset(documentOffset)
                 .currentDocumentIndex(documentIndex)
                 .currentDocumentSize(documentSize)
-                .topOfSequencePointer(documentOffset.getId(), documentOffset)
+                .sequenceHead(documentOffset.getId(), documentOffset)
                 .build();
     }
 
-    public CursorToken addGaps(Set<SequenceOffset> gaps) {
+    public CursorToken detected(Set<SequenceOffset> gaps) {
         if (gaps.isEmpty()) {
             return this;
         } else {
 
-            final Set<SequenceOffset> newGaps = new HashSet<>(this.gaps.size() + gaps.size());
-            newGaps.addAll(this.gaps);
+            final Set<SequenceOffset> newGaps = new HashSet<>(this.detectedGaps.size() + gaps.size());
+            newGaps.addAll(this.detectedGaps);
             newGaps.addAll(gaps);
 
             return this.toBuilder()
-                    .gaps(newGaps)
+                    .detectedGaps(newGaps)
                     .build();
         }
     }
 
-    public CursorToken removeGaps(Set<SequenceOffset> gaps) {
+    public CursorToken resolved(List<ResolvedGap> gaps) {
         if (gaps.isEmpty()) {
             return this;
         } else {
+            final Set<SequenceOffset> resolvedGapOffsets = gaps.stream()
+                    .map(ResolvedGap::getOffset)
+                    .collect(toSet());
 
-            final Set<SequenceOffset> newGaps = this.gaps.stream()
-                    .filter(offset -> !gaps.contains(offset))
-                    .collect(Collectors.toSet());
+            final Set<SequenceOffset> newGaps = this.detectedGaps.stream()
+                    .filter(offset -> !resolvedGapOffsets.contains(offset))
+                    .collect(toSet());
 
             return this.toBuilder()
-                    .gaps(newGaps)
+                    .detectedGaps(newGaps)
                     .build();
         }
     }
 
-    public void forEachSequence(BiConsumer<SequenceOffset, Boolean> consumer) {
-        topOfSequencePointers.values().forEach(pointer -> consumer.accept(pointer, currentDocumentOffset != null && pointer.getId().equals(currentDocumentOffset.getId())));
+    public void forEachSequenceHead(BiConsumer<SequenceOffset, Boolean> consumer) {
+        sequenceHeads.values().forEach(pointer -> consumer.accept(pointer, currentDocumentOffset != null && pointer.getId().equals(currentDocumentOffset.getId())));
     }
 
 }
