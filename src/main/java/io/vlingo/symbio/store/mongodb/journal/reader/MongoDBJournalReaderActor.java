@@ -83,34 +83,47 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
     }
 
     public Completes<List<Entry<Document>>> readNext(int maxCount) {
-        return completes().with(readNextInternal(maxCount, entries -> {}));
+        return completes().with(readNextInternal(maxCount, entries -> {
+        }));
     }
 
     private List<Entry<Document>> readNextInternal(int maxCount, Consumer<List<Entry<Document>>> verifier) {
         final List<ResolvedGap> resolvedGaps = gapResolver.resolveGaps(currentCursorToken, maxCount);
-        final List<Entry<Document>> gapEntries = handleResolved(resolvedGaps);
+        final List<Tuple2<EntrySequenceOffset, Entry<Document>>> gapEntries = handleResolved(resolvedGaps);
 
-        int maxEntries = maxCount - resolvedGaps.size();
+        int remainingEntries = maxCount;
 
         final List<Entry<Document>> result = new ArrayList<>(maxCount);
-        result.addAll(gapEntries);
 
-        CursorToken batchToken = currentCursorToken.resolved(resolvedGaps);
-        boolean queryCurrentTokenDocument = batchToken.hasCurrentDocumentMoreEntries();
+        CursorToken batchToken = currentCursorToken;
 
-        MongoCursor<Document> iterator = getDocumentIterator(maxEntries, batchToken, queryCurrentTokenDocument);
+        for (Tuple2<EntrySequenceOffset, Entry<Document>> gapEntry : gapEntries) {
+            if(remainingEntries == 0) break;
+            if (!batchToken.isMissing(gapEntry._1)) continue;
 
-        while (iterator.hasNext() && result.size() < maxEntries) {
-            final JournalDocumentAdapter nextDocument = new JournalDocumentAdapter(iterator.next());
-            batchToken = batchToken.hasCurrentDocumentMoreEntries() ? batchToken : nextBatchToken(batchToken, nextDocument);
-            final List<JournalDocumentEntry> entries = nextDocument.getEntries();
-            while (batchToken.hasCurrentDocumentMoreEntries() && result.size() < maxEntries) {
-                result.add(asEntry(entries.get(batchToken.getCurrentDocumentIndex())));
-                batchToken = batchToken.nextIndex();
-            }
-            if (queryCurrentTokenDocument) {
-                iterator = getDocumentIterator(maxEntries - result.size(), batchToken, false);
-                queryCurrentTokenDocument = false;
+            result.add(gapEntry._2);
+            batchToken = batchToken.resolved(gapEntry._1);
+            remainingEntries--;
+        }
+
+        if (remainingEntries > 0) {
+            boolean queryCurrentTokenDocument = batchToken.hasCurrentDocumentMoreEntries();
+
+            MongoCursor<Document> iterator = getDocumentIterator(remainingEntries, batchToken, queryCurrentTokenDocument);
+
+            while (iterator.hasNext() && remainingEntries > 0) {
+                final JournalDocumentAdapter nextDocument = new JournalDocumentAdapter(iterator.next());
+                batchToken = batchToken.hasCurrentDocumentMoreEntries() ? batchToken : nextBatchToken(batchToken, nextDocument);
+                final List<JournalDocumentEntry> entries = nextDocument.getEntries();
+                while (batchToken.hasCurrentDocumentMoreEntries() && remainingEntries > 0) {
+                    result.add(asEntry(entries.get(batchToken.getCurrentDocumentOffset().getEntryIndex())));
+                    batchToken = batchToken.nextIndex();
+                    remainingEntries--;
+                }
+                if (queryCurrentTokenDocument) {
+                    iterator = getDocumentIterator(remainingEntries, batchToken, false);
+                    queryCurrentTokenDocument = false;
+                }
             }
         }
         verifier.accept(result);
@@ -118,12 +131,20 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         return result;
     }
 
-    private List<Entry<Document>> handleResolved(List<ResolvedGap> gaps) {
+    private List<Tuple2<EntrySequenceOffset, Entry<Document>>> handleResolved(List<ResolvedGap> gaps) {
         return gaps.stream()
                 .map(ResolvedGap::getData)
                 .filter(Optional::isPresent)
                 .map(Optional::get)
-                .flatMap(d -> d.getEntries().stream().map(this::asEntry))
+                .flatMap(doc -> {
+                    final List<Tuple2<EntrySequenceOffset, Entry<Document>>> entries = new ArrayList<>(doc.getEntries().size());
+                    for (int i = 0; i < doc.getEntries().size(); i++) {
+                        final JournalDocumentEntry entry = doc.getEntries().get(i);
+                        final EntrySequenceOffset entrySequenceOffset = new EntrySequenceOffset(doc.getSequence().toSequenceOffset(), i, doc.getEntries().size());
+                        entries.add(Tuple2.from(entrySequenceOffset, asEntry(entry)));
+                    }
+                    return entries.stream();
+                })
                 .collect(toList());
     }
 
@@ -156,7 +177,7 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         final Set<SequenceOffset> gaps = batchToken.findGaps(nextSequencePointer);
 
         return batchToken
-                .withCurrentDocumentOffset(nextSequencePointer, 0, entries.size())
+                .withCurrentDocumentOffset(new EntrySequenceOffset(nextSequencePointer, 0, entries.size()))
                 .detected(gaps);
     }
 
@@ -173,7 +194,7 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
                 if (currentCursorToken.isBeginning()) {
                     return completes().with(null);
                 } else {
-                    return completes().with(asEntryIdString(currentCursorToken.getCurrentDocumentOffset(), currentCursorToken.getCurrentDocumentIndex()));
+                    return completes().with(asEntryIdString(currentCursorToken.getCurrentDocumentOffset()));
                 }
             case End:
                 return seekToEnd();
@@ -185,14 +206,16 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
                             if (documentForOffset == null) {
                                 return seekToEnd();
                             }
+
                             final Document offsetFilter = new Document("sequence.timestamp", new Document("$gte", documentForOffset.get("sequence.timestamp")).append("$not", new Document("sequence.id", offset.getId()).append("sequence.offset", offset.getOffset())));
                             final List<SequenceOffset> maxOffsets = getMaxOffsets(offsetFilter).collect(toList());
+                            final JournalDocumentAdapter documentAdapter = new JournalDocumentAdapter(documentForOffset);
 
                             CursorToken newToken = CursorToken.beginning();
                             for (SequenceOffset o : maxOffsets) {
-                                newToken = newToken.withCurrentDocumentOffset(o, 0, 0);
+                                newToken = newToken.withSequenceHead(new EntrySequenceOffset(o, 0, 0));
                             }
-                            newToken.withCurrentDocumentOffset(offset, validPointer._2, documentForOffset.getList("entries", Document.class).size());
+                            newToken.withCurrentDocumentOffset(new EntrySequenceOffset(offset, validPointer._2, documentAdapter.getEntries().size()));
 
                             updateCurrentCursorToken(newToken);
 
@@ -202,18 +225,18 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
         }
     }
 
-    private static SequenceOffset extractSequenceOffset(JournalDocumentAdapter entry) {
+    private static EntrySequenceOffset extractSequenceOffset(JournalDocumentAdapter entry) {
         final JournalDocumentSequence sequence = entry.getSequence();
         final String sequenceId = sequence.getId();
         final Long sequenceOffset = sequence.getOffset();
-        return new SequenceOffset(sequenceId, sequenceOffset);
+        return new EntrySequenceOffset(sequenceId, sequenceOffset, 0, entry.getEntries().size());
     }
 
-    private String asEntryIdString(SequenceOffset offset, Integer idx) {
+    private String asEntryIdString(EntrySequenceOffset offset) {
         final String sequenceId = offset.getId();
         final Long sequenceOffset = offset.getOffset();
 
-        return String.format("%s-%s-%s", sequenceId, sequenceOffset, idx);
+        return String.format("%s-%s-%s", sequenceId, sequenceOffset, offset.getEntryIndex());
     }
 
     private Optional<Tuple2<SequenceOffset, Integer>> parseSequenceId(String id) {
@@ -239,15 +262,15 @@ public class MongoDBJournalReaderActor extends AbstractMongoJournalReadingActor 
     private Completes<String> seekToEnd() {
         final CursorToken token = CursorToken.withSequenceOffsets(getMaxOffsets(null).toArray(SequenceOffset[]::new));
         updateCurrentCursorToken(token);
-        return completes().with(asEntryIdString(token.getCurrentDocumentOffset(), token.getCurrentDocumentIndex()));
+        return completes().with(asEntryIdString(token.getCurrentDocumentOffset()));
     }
 
     private Completes<String> seekToBeginning() {
         final Document first = journal.find().sort(new Document("sequence.timestamp", 1)).first();
         if (first == null) return completes().with(null);
         rewind();
-        final SequenceOffset sequenceOffset = extractSequenceOffset(new JournalDocumentAdapter(first));
-        return completes().with(asEntryIdString(sequenceOffset, 0));
+        final EntrySequenceOffset sequenceOffset = extractSequenceOffset(new JournalDocumentAdapter(first));
+        return completes().with(asEntryIdString(sequenceOffset));
     }
 
     @Override

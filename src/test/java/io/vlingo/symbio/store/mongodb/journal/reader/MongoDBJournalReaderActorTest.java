@@ -4,7 +4,6 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
-import io.vlingo.actors.Definition;
 import io.vlingo.actors.World;
 import io.vlingo.symbio.Entry;
 import io.vlingo.symbio.Metadata;
@@ -24,8 +23,10 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
-import java.util.Arrays;
+import java.util.List;
+import java.util.stream.IntStream;
 
+import static java.util.stream.Collectors.toList;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @ExtendWith(EmbeddedMongoDbExtension.class)
@@ -47,10 +48,10 @@ class MongoDBJournalReaderActorTest {
         );
 
         final Class<JournalReader<Entry<Document>>> type = (Class) JournalReader.class;
-        this.underTest = world.actorFor(type, Definition.has(
+        this.underTest = world.actorFor(type,
                 MongoDBJournalReaderActor.class,
-                Definition.parameters("just_the_name", configuration)
-        ));
+                "just_the_name", configuration
+        );
 
         final MongoDatabase vlingoDb = mongo.getDatabase("vlingo");
         journal = vlingoDb.getCollection(MongoDBJournalActor.JOURNAL_COLLECTION_NAME);
@@ -74,122 +75,60 @@ class MongoDBJournalReaderActorTest {
 
         @Test
         void readNext() {
-            final JournalDocumentAdapter collectionEntry = JournalDocumentAdapter.builder()
-                    .streamName("test_stream")
-                    .sequence(
-                            JournalDocumentSequence.builder()
-                                    .timestamp(System.currentTimeMillis())
-                                    .offset(new SequenceOffset("counter_journal_1", 1L))
-                                    .build()
-                    )
-                    .streamVersionStart(1)
-                    .streamVersionEnd(1)
-                    .entry(
-                            JournalDocumentEntry.builder()
-                                    .id("counter_journal_1-1-0")
-                                    .metadata(Metadata.nullMetadata())
-                                    .streamVersion(1)
-                                    .type(String.class.getName())
-                                    .entry(new Document("entry", "this is the serialized entry"))
-                                    .typeVersion(1)
-                                    .build()
-                    )
-                    .build();
-            journal.insertOne(collectionEntry.getDocument());
+            prepareEntry(1, 1, 1);
 
             final Entry<Document> result = underTest.readNext().await();
             assertThat(result.id()).isEqualTo("counter_journal_1-1-0");
         }
 
         @Test
-        void readNextFail() {
-            final JournalDocumentAdapter collectionEntry = JournalDocumentAdapter.builder()
-                    .streamName("test_stream")
-                    .sequence(
-                            JournalDocumentSequence.builder()
-                                    .timestamp(System.currentTimeMillis())
-                                    .offset(new SequenceOffset("counter_journal_1", 1L))
-                                    .build()
-                    )
-                    .streamVersionStart(1)
-                    .streamVersionEnd(1)
-                    .entry(
-                            JournalDocumentEntry.builder()
-                                    .id("counter_journal_1-1-0")
-                                    .metadata(Metadata.nullMetadata())
-                                    .streamVersion(1)
-                                    .type(String.class.getName())
-                                    .entry(new Document("entry", "this is the serialized entry"))
-                                    .typeVersion(1)
-                                    .build()
-                    )
-                    .build();
-            final JournalDocumentAdapter collectionEntry2 = JournalDocumentAdapter.builder()
-                    .streamName("test_stream")
-                    .sequence(
-                            JournalDocumentSequence.builder()
-                                    .timestamp(System.currentTimeMillis())
-                                    .offset(new SequenceOffset("counter_journal_1", 3L))
-                                    .build()
-                    )
-                    .streamVersionStart(4)
-                    .streamVersionEnd(4)
-                    .entry(
-                            JournalDocumentEntry.builder()
-                                    .id("counter_journal_1-3-0")
-                                    .metadata(Metadata.nullMetadata())
-                                    .streamVersion(4)
-                                    .type(String.class.getName())
-                                    .entry(new Document("entry", "this is the serialized entry"))
-                                    .typeVersion(1)
-                                    .build()
-                    )
-                    .build();
-            journal.insertMany(Arrays.asList(collectionEntry.getDocument(), collectionEntry2.getDocument()));
+        void readNextPartialGaps() throws Exception {
+            prepareEntry(1, 1, 1);
+            prepareEntry(3, 4, 4);
 
             underTest.readNext(2).await();
 
-            final JournalDocumentAdapter collectionEntry3 = JournalDocumentAdapter.builder()
-                    .streamName("test_stream")
-                    .sequence(
-                            JournalDocumentSequence.builder()
-                                    .timestamp(System.currentTimeMillis())
-                                    .offset(new SequenceOffset("counter_journal_1", 2L))
-                                    .build()
-                    )
-                    .streamVersionStart(2)
-                    .streamVersionEnd(3)
-                    .entry(
-                            JournalDocumentEntry.builder()
-                                    .id("counter_journal_1-2-0")
-                                    .metadata(Metadata.nullMetadata())
-                                    .streamVersion(2)
-                                    .type(String.class.getName())
-                                    .entry(new Document("entry", "this is the serialized entry"))
-                                    .typeVersion(1)
-                                    .build()
-                    )
-                    .entry(
-                            JournalDocumentEntry.builder()
-                                    .id("counter_journal_1-2-1")
-                                    .metadata(Metadata.nullMetadata())
-                                    .streamVersion(1)
-                                    .type(String.class.getName())
-                                    .entry(new Document("entry", "this is the other serialized entry"))
-                                    .typeVersion(3)
-                                    .build()
-                    )
-                    .build();
-            journal.insertOne(collectionEntry3.getDocument());
+            prepareEntry(2, 2, 3);
 
-            underTest.readNext().outcome();
-//            assertThat(result.id()).isEqualTo("counter_journal_1-1-0");
+            final Entry<Document> result1 = underTest.readNext().await();
+            assertThat(result1.id()).isEqualTo("counter_journal_1-2-0");
+            final Entry<Document> result2 = underTest.readNext().await();
+            assertThat(result2.id()).isEqualTo("counter_journal_1-2-1");
+            assertThat(underTest.readNext().await()).isNull();
         }
 
         @Test
         void readNext1() {
         }
 
+    }
+
+    private void prepareEntry(long offset, int streamVersionStart, int streamVersionEnd) {
+        final List<JournalDocumentEntry> entries = IntStream.range(0, streamVersionEnd + 1 - streamVersionStart)
+                .boxed()
+                .map(i -> JournalDocumentEntry.builder()
+                        .id(String.format("counter_journal_1-%s-%s", offset, i))
+                        .metadata(Metadata.nullMetadata())
+                        .streamVersion(i)
+                        .type(String.class.getName())
+                        .entry(new Document("entry", "this is the serialized entry"))
+                        .typeVersion(1)
+                        .build()
+                )
+                .collect(toList());
+        final JournalDocumentAdapter collectionEntry = JournalDocumentAdapter.builder()
+                .streamName("test_stream")
+                .sequence(
+                        JournalDocumentSequence.builder()
+                                .timestamp(System.currentTimeMillis())
+                                .offset(new SequenceOffset("counter_journal_1", offset))
+                                .build()
+                )
+                .streamVersionStart(streamVersionStart)
+                .streamVersionEnd(streamVersionEnd)
+                .entries(entries)
+                .build();
+        journal.insertOne(collectionEntry.getDocument());
     }
 
     @Test

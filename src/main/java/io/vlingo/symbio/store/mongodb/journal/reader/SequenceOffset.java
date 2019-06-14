@@ -13,12 +13,12 @@ public class SequenceOffset {
     private long offset;
 
     public SequenceOffset(String id) {
-        this(id, START_OF_SEQUENCE);
+        this(id, null);
     }
 
-    public SequenceOffset(String id, long offset) {
+    public SequenceOffset(String id, Long offset) {
         this.id = id;
-        this.offset = offset;
+        this.offset = offset == null ? START_OF_SEQUENCE : offset;
     }
 
     public SequenceOffset next() {

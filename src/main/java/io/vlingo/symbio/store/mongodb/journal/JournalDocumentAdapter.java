@@ -116,6 +116,10 @@ public class JournalDocumentAdapter {
         Document document() {
             return document;
         }
+
+        public SequenceOffset toSequenceOffset() {
+            return new SequenceOffset(getId(), getOffset());
+        }
     }
 
     public static class JournalDocumentState {
